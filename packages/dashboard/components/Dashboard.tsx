@@ -64,6 +64,8 @@ function computeDomains(slice: ChartPoint[], btcOpen: number, atr: number | null
 
 const MIN_VISIBLE = 6;
 const INTERP_DURATION = 800; // ms – smooth transition between data points
+const X_DOMAIN_EXPAND_MS = 400; // ms – smooth X domain expand when new point added
+const POLL_INTERVAL_MS = 1000; // match fetch interval so X expands smoothly between points
 
 interface DashboardProps {
   interval?: number;
@@ -89,6 +91,17 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
 
   // ── Zoom/Pan State ──
   const [view, setView] = useState({ lo: 0, hi: 0 });
+  const [displayView, setDisplayView] = useState({ lo: 0, hi: 0 });
+  const xDomainAnimRef = useRef<{
+    from: { lo: number; hi: number };
+    to: { lo: number; hi: number };
+    startTime: number;
+  } | null>(null);
+  const prevViewRef = useRef({ lo: 0, hi: 0 });
+  const displayViewRef = useRef({ lo: 0, hi: 0 });
+  const lastPointTimeRef = useRef(0);
+  const chartHistoryLenRef = useRef(0);
+  const viewRef = useRef({ lo: 0, hi: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const dragRef = useRef<{
     startX: number;
@@ -206,6 +219,36 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
     return () => clearInterval(interval);
   }, []);
 
+  chartHistoryLenRef.current = chartHistory.length;
+  viewRef.current = view;
+
+  // When a new point is added, mark time so continuous X expand can run
+  useEffect(() => {
+    lastPointTimeRef.current = performance.now();
+  }, [chartHistory.length]);
+
+  // ── When view changes: animate X domain only when not at live end (e.g. reset zoom), else snap ──
+  useEffect(() => {
+    const prev = prevViewRef.current;
+    const N = chartHistory.length;
+    const expandingAtEnd =
+      view.hi > prev.hi && view.lo === prev.lo && view.hi > 0;
+    const atLiveEnd = view.hi === N && N > 0;
+    if (expandingAtEnd && !atLiveEnd) {
+      xDomainAnimRef.current = {
+        from: { ...displayViewRef.current },
+        to: { ...view },
+        startTime: performance.now(),
+      };
+    } else {
+      xDomainAnimRef.current = null;
+      const next = { lo: view.lo, hi: view.hi };
+      setDisplayView(next);
+      displayViewRef.current = next;
+    }
+    prevViewRef.current = { ...view };
+  }, [view, chartHistory.length]);
+
   // ── Detect new data points → kick off smooth animation ──
   useEffect(() => {
     const len = chartHistory.length;
@@ -223,17 +266,16 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
     prevChartLenRef.current = len;
   }, [chartHistory]);
 
-  // ── requestAnimationFrame loop for smooth interpolation ──
+  // ── requestAnimationFrame loop for smooth interpolation + X domain expand ──
   useEffect(() => {
     let active = true;
     const tick = () => {
       if (!active) return;
+      const now = performance.now();
+
       const a = animStateRef.current;
       if (a) {
-        const t = Math.min(
-          1,
-          (performance.now() - a.startTime) / INTERP_DURATION
-        );
+        const t = Math.min(1, (now - a.startTime) / INTERP_DURATION);
         const e = 1 - (1 - t) * (1 - t) * (1 - t); // easeOutCubic
         const val = {
           btc: a.fromBtc + (a.toBtc - a.fromBtc) * e,
@@ -243,6 +285,36 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
         setInterpolated(val);
         if (t >= 1) animStateRef.current = null;
       }
+
+      const xAnim = xDomainAnimRef.current;
+      if (xAnim) {
+        const t = Math.min(
+          1,
+          (now - xAnim.startTime) / X_DOMAIN_EXPAND_MS
+        );
+        const e = 1 - (1 - t) * (1 - t) * (1 - t); // easeOutCubic
+        const next = {
+          lo: xAnim.from.lo + (xAnim.to.lo - xAnim.from.lo) * e,
+          hi: xAnim.from.hi + (xAnim.to.hi - xAnim.from.hi) * e,
+        };
+        displayViewRef.current = next;
+        setDisplayView(next);
+        if (t >= 1) xDomainAnimRef.current = null;
+      } else {
+        const n = chartHistoryLenRef.current;
+        const v = viewRef.current;
+        if (n > 0 && v.hi === n) {
+          const elapsed = now - lastPointTimeRef.current;
+          const progress = Math.min(1, elapsed / POLL_INTERVAL_MS);
+          const targetHi = n + progress;
+          setDisplayView((prev) => {
+            const next = { ...prev, hi: targetHi };
+            displayViewRef.current = next;
+            return next;
+          });
+        }
+      }
+
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -253,10 +325,13 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
   }, []);
 
   const N = chartHistory.length;
-  const slice = useMemo(
-    () => chartHistory.slice(view.lo, view.hi),
-    [chartHistory, view]
-  );
+  const atLiveEnd = view.hi >= N && N > 0;
+  const slice = useMemo(() => {
+    const lo = Math.floor(displayView.lo);
+    if (atLiveEnd) return chartHistory.slice(lo, N);
+    const hi = Math.min(Math.floor(displayView.hi) + 1, N);
+    return chartHistory.slice(lo, hi);
+  }, [chartHistory, displayView, atLiveEnd, N]);
   
   const poly = data?.polymarket;
   const priceToBeat = poly?.priceToBeat ?? null;
@@ -265,29 +340,70 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
     return chartHistory.length > 0 ? chartHistory[0].btc : 0;
   }, [chartHistory]);
 
-  const { btcDomain, polyDomain, btcOpen } = useMemo(
-    () => computeDomains(slice, btcOpenPrice, atr, atrMultiplier, visible, priceToBeat),
-    [slice, btcOpenPrice, atr, atrMultiplier, visible, priceToBeat]
+  const xTicks = useMemo(() => {
+    const range = displayView.hi - displayView.lo;
+    if (range <= 0) return [];
+    const step = Math.max(range / 8, 0.001);
+    const ticks: number[] = [];
+    for (let i = 0; i <= 8; i++) {
+      const v = displayView.lo + (i / 8) * range;
+      ticks.push(v);
+    }
+    return ticks;
+  }, [displayView]);
+
+  const formatXTick = useCallback(
+    (idx: number) => {
+      const i = Math.round(idx);
+      if (i >= chartHistory.length) {
+        return new Date().toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        });
+      }
+      const p = chartHistory[i];
+      return p?.time ?? "";
+    },
+    [chartHistory]
   );
 
-  const xTicks = useMemo(() => {
-    if (slice.length <= 10) return slice.map((d) => d.time);
-    const step = Math.max(1, Math.floor(slice.length / 8));
-    return slice.filter((_, i) => i % step === 0).map((d) => d.time);
-  }, [slice]);
-
-  // ── Smoothed slice: replaces the last point with its interpolated value ──
+  // ── Smoothed slice: optional interpolated last point + live trailing point when at end ──
   const displaySlice = useMemo(() => {
-    if (!slice.length || !interpolated || view.hi < chartHistory.length)
-      return slice;
-    const out = slice.slice();
-    out[out.length - 1] = {
-      ...out[out.length - 1],
-      btc: interpolated.btc,
-      poly: interpolated.poly,
-    };
+    const nowStr = new Date().toLocaleTimeString("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    let out = slice.slice();
+    if (out.length && interpolated && view.hi >= chartHistory.length) {
+      out[out.length - 1] = {
+        ...out[out.length - 1],
+        btc: interpolated.btc,
+        poly: interpolated.poly,
+      };
+    }
+    if (atLiveEnd && data?.btcPrice != null && data?.polymarket?.upPrice != null) {
+      const last = out[out.length - 1];
+      out = [
+        ...out,
+        {
+          idx: N,
+          time: nowStr,
+          btc: data.btcPrice,
+          poly: data.polymarket.upPrice,
+        },
+      ];
+    }
     return out;
-  }, [slice, interpolated, view.hi, chartHistory.length]);
+  }, [slice, interpolated, view.hi, chartHistory.length, atLiveEnd, N, data?.btcPrice, data?.polymarket?.upPrice]);
+
+  const { btcDomain, polyDomain, btcOpen } = useMemo(
+    () => computeDomains(displaySlice, btcOpenPrice, atr, atrMultiplier, visible, priceToBeat),
+    [displaySlice, btcOpenPrice, atr, atrMultiplier, visible, priceToBeat]
+  );
 
   const tickStyle = {
     fill: "#555",
@@ -461,11 +577,15 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
                   <CartesianGrid stroke="#141420" vertical={false} />
 
                   <XAxis
-                    dataKey="time"
+                    type="number"
+                    dataKey="idx"
+                    domain={[displayView.lo, displayView.hi]}
                     ticks={xTicks}
+                    tickFormatter={formatXTick}
                     tick={tickStyle}
                     axisLine={{ stroke: "#1e1e2e" }}
                     tickLine={false}
+                    allowDataOverflow
                   />
 
                   <YAxis
@@ -598,8 +718,8 @@ export default function Dashboard({ interval = 15 }: DashboardProps) {
             <div
               className={styles.scrollbarThumb}
               style={{
-                left: `${(view.lo / Math.max(1, N)) * 100}%`,
-                width: `${((view.hi - view.lo) / Math.max(1, N)) * 100}%`,
+                left: `${(displayView.lo / Math.max(1, N)) * 100}%`,
+                width: `${((displayView.hi - displayView.lo) / Math.max(1, N)) * 100}%`,
                 transition: isDragging ? "none" : "left .08s, width .08s",
               }}
             />
